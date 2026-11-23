@@ -1,8 +1,13 @@
-"""Shared data loading and analysis used by the analytics pages (4-7)."""
+"""Shared data loading and analysis used by the analytics pages (4-8)."""
+import json
+import urllib.parse
+import urllib.request
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 from sqlalchemy import text
@@ -161,3 +166,64 @@ def retention_offers(df, churn, rules, clv):
         "Loyalty coupon on " + out["Favorite commodity"].fillna("their usual items"))
     out["_order"] = out["Risk"].map({"High": 0, "Medium": 1})
     return out.sort_values(["_order", clv.name], ascending=[True, False]).drop(columns="_order")
+
+
+# One representative city per store region (assumption: the dataset only gives the region name).
+REGION_CITIES = {"CENTRAL": ("Indianapolis", 39.77, -86.16), "EAST": ("Cincinnati", 39.10, -84.51),
+                 "SOUTH": ("Houston", 29.76, -95.37), "WEST": ("Los Angeles", 34.05, -118.24)}
+WEATHER = ["Temperature (F)", "Rain (in)", "Snow (in)"]
+
+
+@st.cache_data(ttl=86400, show_spinner="Fetching historical weather from Open-Meteo...")
+def load_weather(start, end):
+    """Daily weather per store region from the free Open-Meteo historical API (no key needed)."""
+    frames = []
+    for region, (_, lat, lon) in REGION_CITIES.items():
+        query = urllib.parse.urlencode({
+            "latitude": lat, "longitude": lon, "start_date": start, "end_date": end,
+            "daily": "temperature_2m_mean,precipitation_sum,snowfall_sum",
+            "temperature_unit": "fahrenheit", "precipitation_unit": "inch", "timezone": "auto"})
+        with urllib.request.urlopen(f"https://archive-api.open-meteo.com/v1/archive?{query}", timeout=30) as r:
+            frames.append(pd.DataFrame(json.load(r)["daily"]).assign(STORE_R=region))
+    w = pd.concat(frames).rename(columns={"time": "DATE", "temperature_2m_mean": WEATHER[0],
+                                          "precipitation_sum": WEATHER[1], "snowfall_sum": WEATHER[2]})
+    w["DATE"] = pd.to_datetime(w["DATE"])
+    return w
+
+
+def weather_daily(df, weather):
+    """Daily spend per store region joined to that region's weather on the same date."""
+    d = (df.assign(STORE_R=df["STORE_R"].str.upper())
+           .groupby(["DATE", "STORE_R"]).agg(Spend=("SPEND", "sum"), Baskets=("BASKET_NUM", "nunique"))
+           .reset_index().merge(weather, on=["DATE", "STORE_R"]))
+    d["Weekday"] = d["DATE"].dt.day_name()
+    return d
+
+
+def weather_by_commodity(df, weather, min_spend=500):
+    """Correlation between temperature and each commodity's share of a region's daily spend."""
+    c = (df.assign(STORE_R=df["STORE_R"].str.upper())
+           .groupby(["DATE", "STORE_R", "COMMODITY"])["SPEND"].sum().unstack(fill_value=0))
+    c = c.loc[:, c.sum() >= min_spend]
+    share = c.div(c.sum(axis=1), axis=0)
+    temp = share.join(weather.set_index(["DATE", "STORE_R"])[WEATHER[0]], how="inner")
+    return temp.drop(columns=WEATHER[0]).corrwith(temp[WEATHER[0]]).dropna().sort_values()
+
+
+@st.cache_data
+def weather_forecast(d):
+    """Linear regression of daily regional spend, trained on earlier months and tested on the last two,
+    once with calendar features only and once with weather added, to measure what weather contributes."""
+    base = pd.get_dummies(d[["STORE_R", "Weekday"]], drop_first=True).astype(int)
+    X_full = base.join(d[WEATHER])
+    test = d["DATE"].dt.to_period("M") >= d["DATE"].dt.to_period("M").max() - 1
+    metrics, preds = {}, None
+    for name, X in (("Without weather", base), ("With weather", X_full)):
+        model = LinearRegression().fit(X[~test], d.loc[~test, "Spend"])
+        pred = model.predict(X[test])
+        metrics[name] = {"R2": r2_score(d.loc[test, "Spend"], pred),
+                         "MAE": mean_absolute_error(d.loc[test, "Spend"], pred)}
+        if name == "With weather":
+            preds = d.loc[test, ["DATE", "Spend"]].assign(Predicted=pred)
+            effect = pd.Series(model.coef_, index=X.columns)[WEATHER]
+    return metrics, preds, effect

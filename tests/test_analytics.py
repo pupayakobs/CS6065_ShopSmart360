@@ -69,3 +69,15 @@ def test_clv_and_offers():
     offers = a.retention_offers(df, churn, a.basket_rules(df, "COMMODITY", 10), clv)
     assert set(range(1, 9)) <= set(offers.index)
     assert offers["Suggested offer"].notna().all()
+
+
+def test_weather_join_and_forecast():
+    df = a.prepare(*fake_tables())
+    dates = pd.date_range(df["DATE"].min(), df["DATE"].max())
+    weather = pd.DataFrame({"DATE": dates, "STORE_R": "EAST", "Temperature (F)": np.linspace(80, 20, len(dates)),
+                            "Rain (in)": 0.1, "Snow (in)": 0.0})
+    d = a.weather_daily(df, weather)
+    assert len(d) == df["DATE"].nunique() and np.isclose(d["Spend"].sum(), df["SPEND"].sum())
+    metrics, preds, effect = a.weather_forecast(d)
+    assert set(metrics) == {"Without weather", "With weather"} and len(preds) > 0 and len(effect) == 3
+    assert len(a.weather_by_commodity(df, weather, min_spend=0)) == 10
